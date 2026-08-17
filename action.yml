@@ -44,11 +44,27 @@ inputs:
     required: false
     default: "update"
   jira_fail_on_error:
-    description: "Fail the action if posting to Jira fails (default: warn only)"
+    description: "Fail the action if posting to Jira or transitioning an issue fails (default: warn only)"
     required: false
     default: "false"
+  transition_to:
+    description: "Status name to transition matched issues to (e.g. 'QA', 'Done'). Empty = no transition. Uses jira_base_url/email/token; obeys jira_fail_on_error (warn by default)."
+    required: false
+    default: ""
+  create_issue_on_failure:
+    description: "Open a Jira ticket when a run fails (independent of issue keys — covers failing dependabot PRs). Run this from a workflow_run on your CI workflow, or an `if: failure()` job. Dedupes by label so a given PR/branch reuses one open ticket. Uses jira_base_url/email/token; obeys jira_fail_on_error."
+    required: false
+    default: "false"
+  issue_type:
+    description: "Issue type for the ticket created by create_issue_on_failure (must exist in the project)."
+    required: false
+    default: "Bug"
+  issue_project:
+    description: "Project key for the ticket created by create_issue_on_failure. Defaults to the first entry of `projects`."
+    required: false
+    default: ""
   github_token:
-    description: "GitHub token for downloading GitHub-hosted images in PR bodies and authenticating API requests. Usually secrets.GITHUB_TOKEN."
+    description: "GitHub token used to authorize image downloads from GitHub-hosted URLs in PR bodies. Usually secrets.GITHUB_TOKEN."
     required: false
     default: ""
   allowed_image_hosts:
@@ -63,7 +79,9 @@ outputs:
     description: "First Jira issue key found (convenience)"
   found:
     description: '"true" if any keys were found, "false" otherwise'
+  created_issue:
+    description: "Key of the Jira ticket created (or reused) by create_issue_on_failure, or empty"
 
 runs:
-  using: "node20"
+  using: "node24"
   main: "dist/index.js"

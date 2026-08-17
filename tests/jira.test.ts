@@ -1,12 +1,38 @@
 import {
   postToJira,
+  transitionIssues,
   extractImageUrls,
   replaceImageUrls,
   downloadImage,
   isSafeUrl,
+  isPrivateIp,
   deduplicateFilenames,
 } from "../src/jira";
 import { JiraConfig, PrContext } from "../src/types";
+
+jest.mock("node:dns/promises", () => ({
+  lookup: jest.fn(async (hostname: string, options?: { all?: boolean }) => {
+    // The production code always uses { all: true }; older tests that pass no
+    // options receive the legacy single-record shape.
+    let addresses: Array<{ address: string; family: number }>;
+    if (hostname === "resolves-to-private.example.com") {
+      addresses = [{ address: "127.0.0.1", family: 4 }];
+    } else if (hostname === "resolves-to-10.example.com") {
+      addresses = [{ address: "10.0.0.1", family: 4 }];
+    } else if (hostname === "resolves-to-mapped-ipv6.example.com") {
+      addresses = [{ address: "::ffff:127.0.0.1", family: 6 }];
+    } else if (hostname === "resolves-to-mixed.example.com") {
+      // One public, one private — any-private must reject
+      addresses = [
+        { address: "93.184.216.34", family: 4 },
+        { address: "10.0.0.1", family: 4 },
+      ];
+    } else {
+      addresses = [{ address: "93.184.216.34", family: 4 }];
+    }
+    return options?.all ? addresses : addresses[0];
+  }),
+}));
 
 jest.mock("@actions/core", () => ({
   info: jest.fn(),
@@ -361,49 +387,118 @@ describe("replaceImageUrls", () => {
   });
 });
 
+describe("isPrivateIp", () => {
+  it("detects loopback", () => {
+    expect(isPrivateIp("127.0.0.1")).toBe(true);
+  });
+
+  it("detects 10.x", () => {
+    expect(isPrivateIp("10.0.0.1")).toBe(true);
+  });
+
+  it("detects 192.168.x", () => {
+    expect(isPrivateIp("192.168.1.1")).toBe(true);
+  });
+
+  it("detects 172.16.x", () => {
+    expect(isPrivateIp("172.16.0.1")).toBe(true);
+  });
+
+  it("allows public IPs", () => {
+    expect(isPrivateIp("93.184.216.34")).toBe(false);
+  });
+});
+
 describe("isSafeUrl", () => {
-  it("allows HTTPS URLs", () => {
-    expect(isSafeUrl("https://example.com/img.png")).toBe(true);
+  it("allows HTTPS URLs", async () => {
+    await expect(isSafeUrl("https://example.com/img.png")).resolves.toBe(true);
   });
 
-  it("rejects HTTP URLs", () => {
-    expect(isSafeUrl("http://example.com/img.png")).toBe(false);
+  it("rejects HTTP URLs", async () => {
+    await expect(isSafeUrl("http://example.com/img.png")).resolves.toBe(false);
   });
 
-  it("rejects private IP 127.0.0.1", () => {
-    expect(isSafeUrl("https://127.0.0.1/img.png")).toBe(false);
+  it("rejects private IP 127.0.0.1", async () => {
+    await expect(isSafeUrl("https://127.0.0.1/img.png")).resolves.toBe(false);
   });
 
-  it("rejects private IP 10.x", () => {
-    expect(isSafeUrl("https://10.0.0.1/img.png")).toBe(false);
+  it("rejects private IP 10.x", async () => {
+    await expect(isSafeUrl("https://10.0.0.1/img.png")).resolves.toBe(false);
   });
 
-  it("rejects private IP 192.168.x", () => {
-    expect(isSafeUrl("https://192.168.1.1/img.png")).toBe(false);
+  it("rejects private IP 192.168.x", async () => {
+    await expect(isSafeUrl("https://192.168.1.1/img.png")).resolves.toBe(false);
   });
 
-  it("rejects private IP 172.16.x", () => {
-    expect(isSafeUrl("https://172.16.0.1/img.png")).toBe(false);
+  it("rejects private IP 172.16.x", async () => {
+    await expect(isSafeUrl("https://172.16.0.1/img.png")).resolves.toBe(false);
   });
 
-  it("rejects link-local IP 169.254.x", () => {
-    expect(isSafeUrl("https://169.254.1.1/img.png")).toBe(false);
+  it("rejects link-local IP 169.254.x", async () => {
+    await expect(isSafeUrl("https://169.254.1.1/img.png")).resolves.toBe(false);
   });
 
-  it("allows HTTPS when host is in allowedHosts", () => {
-    expect(
+  it("allows HTTPS when host is in allowedHosts", async () => {
+    await expect(
       isSafeUrl("https://cdn.example.com/img.png", ["cdn.example.com"]),
-    ).toBe(true);
+    ).resolves.toBe(true);
   });
 
-  it("rejects HTTPS when host is not in allowedHosts", () => {
-    expect(isSafeUrl("https://evil.com/img.png", ["cdn.example.com"])).toBe(
-      false,
+  it("rejects HTTPS when host is not in allowedHosts", async () => {
+    await expect(
+      isSafeUrl("https://evil.com/img.png", ["cdn.example.com"]),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects invalid URLs", async () => {
+    await expect(isSafeUrl("not-a-url")).resolves.toBe(false);
+  });
+
+  it("rejects hostnames that resolve to private IPs (DNS rebinding)", async () => {
+    await expect(
+      isSafeUrl("https://resolves-to-private.example.com/img.png"),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects hostnames that resolve to 10.x IPs", async () => {
+    await expect(
+      isSafeUrl("https://resolves-to-10.example.com/img.png"),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects hostnames that resolve to IPv4-mapped IPv6 private addresses", async () => {
+    await expect(
+      isSafeUrl("https://resolves-to-mapped-ipv6.example.com/img.png"),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects when any of multiple resolved addresses is private", async () => {
+    await expect(
+      isSafeUrl("https://resolves-to-mixed.example.com/img.png"),
+    ).resolves.toBe(false);
+  });
+
+  it("does not treat hostname '10.example.com' as a private IP literal", async () => {
+    // The hostname starts with '10.' but is not an IP literal — DNS lookup
+    // returns a public address, so it should be allowed.
+    await expect(isSafeUrl("https://10.example.com/img.png")).resolves.toBe(
+      true,
     );
   });
 
-  it("rejects invalid URLs", () => {
-    expect(isSafeUrl("not-a-url")).toBe(false);
+  it("still runs private-IP checks when an allowlist is provided", async () => {
+    // Allowlisted hostname that resolves to a private IP must still be rejected
+    await expect(
+      isSafeUrl("https://resolves-to-10.example.com/img.png", [
+        "resolves-to-10.example.com",
+      ]),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects literal private IPs even if allowlisted", async () => {
+    await expect(
+      isSafeUrl("https://127.0.0.1/img.png", ["127.0.0.1"]),
+    ).resolves.toBe(false);
   });
 });
 
@@ -483,16 +578,16 @@ describe("deduplicateFilenames", () => {
     expect(result.get("https://b.com/2.png")).toBe("2.png");
   });
 
-  it("appends -1, -2 for colliding filenames", () => {
+  it("keeps the first occurrence and suffixes duplicates", () => {
     const entries = [
       { url: "https://a.com/img.png", filename: "img.png" },
       { url: "https://b.com/img.png", filename: "img.png" },
       { url: "https://c.com/img.png", filename: "img.png" },
     ];
     const result = deduplicateFilenames(entries);
-    expect(result.get("https://a.com/img.png")).toBe("img-1.png");
-    expect(result.get("https://b.com/img.png")).toBe("img-2.png");
-    expect(result.get("https://c.com/img.png")).toBe("img-3.png");
+    expect(result.get("https://a.com/img.png")).toBe("img.png");
+    expect(result.get("https://b.com/img.png")).toBe("img-1.png");
+    expect(result.get("https://c.com/img.png")).toBe("img-2.png");
   });
 
   it("handles files without extensions", () => {
@@ -501,8 +596,22 @@ describe("deduplicateFilenames", () => {
       { url: "https://b.com/image", filename: "image" },
     ];
     const result = deduplicateFilenames(entries);
-    expect(result.get("https://a.com/image")).toBe("image-1");
-    expect(result.get("https://b.com/image")).toBe("image-2");
+    expect(result.get("https://a.com/image")).toBe("image");
+    expect(result.get("https://b.com/image")).toBe("image-1");
+  });
+
+  it("avoids re-colliding with an existing non-duplicate name", () => {
+    // Two files named img.png and one already-named img-1.png: the deduped
+    // second copy must skip img-1.png and use img-2.png instead.
+    const entries = [
+      { url: "https://a.com/img.png", filename: "img.png" },
+      { url: "https://b.com/img.png", filename: "img.png" },
+      { url: "https://c.com/img-1.png", filename: "img-1.png" },
+    ];
+    const result = deduplicateFilenames(entries);
+    expect(result.get("https://a.com/img.png")).toBe("img.png");
+    expect(result.get("https://b.com/img.png")).toBe("img-2.png");
+    expect(result.get("https://c.com/img-1.png")).toBe("img-1.png");
   });
 });
 
@@ -728,5 +837,158 @@ describe("postToJira with images", () => {
     // Only 1 download (deduped) + 1 upload + 1 comment = 3
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(core.info).toHaveBeenCalledWith("Found 2 image(s) in PR body");
+  });
+});
+
+describe("transitionIssues", () => {
+  const origFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = origFetch;
+    core.info.mockClear();
+    core.warning.mockClear();
+  });
+
+  it("transitions an issue when a matching transition exists", async () => {
+    const fetchMock = mockFetch([
+      {
+        status: 200,
+        body: {
+          transitions: [
+            { id: "21", name: "In Progress" },
+            { id: "31", name: "QA" },
+          ],
+        },
+      },
+      { status: 204 },
+    ]);
+    global.fetch = fetchMock;
+
+    await transitionIssues(["PROJ-1"], "QA", config, false);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const [listUrl, listOpts] = getCall(fetchMock, 0);
+    expect(listUrl).toBe(
+      "https://test.atlassian.net/rest/api/2/issue/PROJ-1/transitions",
+    );
+    expect(listOpts.method).toBeUndefined();
+
+    const [postUrl, postOpts] = getCall(fetchMock, 1);
+    expect(postUrl).toBe(
+      "https://test.atlassian.net/rest/api/2/issue/PROJ-1/transitions",
+    );
+    expect(postOpts.method).toBe("POST");
+    expect(JSON.parse(postOpts.body as string)).toEqual({
+      transition: { id: "31" },
+    });
+
+    expect(core.info).toHaveBeenCalledWith("Transitioned PROJ-1 → QA");
+  });
+
+  it("matches the target status case-insensitively", async () => {
+    const fetchMock = mockFetch([
+      { status: 200, body: { transitions: [{ id: "31", name: "QA" }] } },
+      { status: 204 },
+    ]);
+    global.fetch = fetchMock;
+
+    await transitionIssues(["PROJ-1"], "qa", config, false);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(getCall(fetchMock, 1)[1].body as string)).toEqual({
+      transition: { id: "31" },
+    });
+  });
+
+  it("warns and skips the POST when no matching transition exists", async () => {
+    const fetchMock = mockFetch([
+      {
+        status: 200,
+        body: { transitions: [{ id: "21", name: "In Progress" }] },
+      },
+    ]);
+    global.fetch = fetchMock;
+
+    await transitionIssues(["PROJ-1"], "QA", config, false);
+
+    // Only the GET — no POST attempted.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('No "QA" transition available for PROJ-1'),
+    );
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining("In Progress"),
+    );
+  });
+
+  it("transitions multiple issues", async () => {
+    const fetchMock = mockFetch([
+      { status: 200, body: { transitions: [{ id: "41", name: "Done" }] } },
+      { status: 204 },
+      { status: 200, body: { transitions: [{ id: "41", name: "Done" }] } },
+      { status: 204 },
+    ]);
+    global.fetch = fetchMock;
+
+    await transitionIssues(["PROJ-1", "PROJ-2"], "Done", config, false);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(core.info).toHaveBeenCalledWith("Transitioned PROJ-1 → Done");
+    expect(core.info).toHaveBeenCalledWith("Transitioned PROJ-2 → Done");
+  });
+
+  it("warns on API error by default (failOnError=false)", async () => {
+    global.fetch = mockFetch([{ status: 500 }]);
+
+    await transitionIssues(["PROJ-1"], "QA", config, false);
+
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to transition PROJ-1"),
+    );
+  });
+
+  it("throws on API error when failOnError=true", async () => {
+    global.fetch = mockFetch([{ status: 500 }]);
+
+    await expect(
+      transitionIssues(["PROJ-1"], "QA", config, true),
+    ).rejects.toThrow("Failed to transition PROJ-1");
+  });
+
+  it("sends correct Basic auth header on the transitions request", async () => {
+    const fetchMock = mockFetch([
+      { status: 200, body: { transitions: [{ id: "31", name: "QA" }] } },
+      { status: 204 },
+    ]);
+    global.fetch = fetchMock;
+
+    await transitionIssues(["PROJ-1"], "QA", config, false);
+
+    const expectedAuth =
+      "Basic " + Buffer.from("user@example.com:test-token").toString("base64");
+    const [, getOpts] = getCall(fetchMock, 0);
+    expect((getOpts.headers as Record<string, string>).Authorization).toBe(
+      expectedAuth,
+    );
+  });
+
+  it("strips a trailing slash from the base URL", async () => {
+    const fetchMock = mockFetch([
+      { status: 200, body: { transitions: [{ id: "31", name: "QA" }] } },
+      { status: 204 },
+    ]);
+    global.fetch = fetchMock;
+
+    await transitionIssues(
+      ["PROJ-1"],
+      "QA",
+      { ...config, baseUrl: "https://test.atlassian.net/" },
+      false,
+    );
+
+    expect(getCall(fetchMock, 0)[0]).toBe(
+      "https://test.atlassian.net/rest/api/2/issue/PROJ-1/transitions",
+    );
   });
 });

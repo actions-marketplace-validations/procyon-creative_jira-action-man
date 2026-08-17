@@ -30202,6 +30202,180 @@ function mergeAndSort(keys) {
 
 /***/ }),
 
+/***/ 1633:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.resolveFailureContext = resolveFailureContext;
+exports.buildFailureIssue = buildFailureIssue;
+exports.createFailureIssue = createFailureIssue;
+const core = __importStar(__nccwpck_require__(7484));
+const github = __importStar(__nccwpck_require__(3228));
+const jira_1 = __nccwpck_require__(7647);
+/**
+ * Work out what failed, from the GitHub event context.
+ *
+ * - `workflow_run`: the natural "CI finished" signal. We only return a context
+ *   when the run actually FAILED (conclusion === "failure"); otherwise null so
+ *   the caller does nothing. PR info comes from `workflow_run.pull_requests`.
+ * - any other event (e.g. `pull_request`): we assume the workflow gated this
+ *   step on failure itself (`if: failure()`), so we build the context from the
+ *   PR payload (or the ref for pushes).
+ *
+ * Returns null when there's nothing to file a ticket for.
+ */
+function resolveFailureContext() {
+    const { context } = github;
+    const repo = context.payload.repository?.full_name ||
+        (context.payload.repository
+            ? `${context.payload.repository.owner?.login}/${context.payload.repository.name}`
+            : undefined);
+    if (context.eventName === "workflow_run") {
+        const wr = context.payload.workflow_run;
+        if (!wr)
+            return null;
+        // Only act on genuine failures.
+        if (wr.conclusion !== "failure")
+            return null;
+        const prNumber = wr.pull_requests?.[0]?.number;
+        const branch = wr.head_branch;
+        const url = prNumber && repo
+            ? `https://github.com/${repo}/pull/${prNumber}`
+            : undefined;
+        return {
+            title: prNumber ? `PR #${prNumber}` : `branch ${branch ?? "?"}`,
+            repo,
+            prNumber,
+            branch,
+            url,
+            runUrl: wr.html_url,
+        };
+    }
+    const pr = context.payload.pull_request;
+    if (pr) {
+        return {
+            title: pr.title || `PR #${pr.number}`,
+            repo,
+            prNumber: pr.number,
+            branch: pr.head?.ref,
+            url: pr.html_url,
+        };
+    }
+    // Fallback: a push/other event the workflow gated on failure.
+    const branch = context.ref?.replace(/^refs\/heads\//, "");
+    return { title: branch ? `branch ${branch}` : "build", repo, branch };
+}
+function slug(s) {
+    return s
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40);
+}
+/**
+ * Build the summary, description and labels for a CI-failure ticket. Pure — no
+ * network. The second label is a deterministic dedup key so repeated failures of
+ * the same PR/branch reuse a single open ticket.
+ */
+function buildFailureIssue(ctx) {
+    const idLabel = ctx.prNumber
+        ? `PR #${ctx.prNumber}`
+        : ctx.branch
+            ? `branch ${ctx.branch}`
+            : "build";
+    const summary = `CI failed: ${idLabel}${ctx.prNumber && ctx.branch ? ` (${ctx.branch})` : ""}`.slice(0, 250);
+    const idSlug = ctx.prNumber
+        ? `pr-${ctx.prNumber}`
+        : slug(ctx.branch || "build");
+    const repoSlug = ctx.repo ? slug(ctx.repo) : "repo";
+    const dedupeLabel = `cifail-${repoSlug}-${idSlug}`.slice(0, 50);
+    const labels = ["ci-failure", dedupeLabel];
+    const lines = [
+        "A CI run failed. This ticket was opened automatically by jira-action-man.",
+        "",
+    ];
+    if (ctx.url)
+        lines.push(`* PR: ${ctx.url}`);
+    if (ctx.branch)
+        lines.push(`* Branch: {{${ctx.branch}}}`);
+    if (ctx.runUrl)
+        lines.push(`* Failed run: ${ctx.runUrl}`);
+    if (ctx.repo)
+        lines.push(`* Repo: ${ctx.repo}`);
+    return { summary, description: lines.join("\n"), labels, dedupeLabel };
+}
+/**
+ * Create a CI-failure ticket, unless an open one already exists for the same
+ * PR/branch (matched by the dedup label). Obeys failOnError (warn by default).
+ * Returns the issue key (existing or new), or null on a swallowed error.
+ */
+async function createFailureIssue(ctx, config, projectKey, issueType, failOnError) {
+    const { summary, description, labels, dedupeLabel } = buildFailureIssue(ctx);
+    try {
+        const jql = `project = "${projectKey}" AND statusCategory != Done AND labels = "${dedupeLabel}"`;
+        const existing = await (0, jira_1.searchIssue)(config, jql);
+        if (existing) {
+            core.info(`Open CI-failure ticket already exists for ${dedupeLabel}: ${existing} — not creating a duplicate`);
+            return existing;
+        }
+        const key = await (0, jira_1.createIssue)(config, {
+            projectKey,
+            issueType,
+            summary,
+            description,
+            labels,
+        });
+        core.info(`Created CI-failure ticket ${key} (${projectKey})`);
+        return key;
+    }
+    catch (error) {
+        const msg = `Failed to create CI-failure issue: ${error instanceof Error ? error.message : String(error)}`;
+        if (failOnError) {
+            throw new Error(msg);
+        }
+        core.warning(msg);
+        return null;
+    }
+}
+
+
+/***/ }),
+
 /***/ 9407:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -30246,6 +30420,7 @@ const github = __importStar(__nccwpck_require__(3228));
 const extract_1 = __nccwpck_require__(6542);
 const sources_1 = __nccwpck_require__(8578);
 const jira_1 = __nccwpck_require__(7647);
+const failure_1 = __nccwpck_require__(1633);
 function parseInputs() {
     const projectsRaw = core.getInput("projects");
     const projects = projectsRaw
@@ -30282,6 +30457,18 @@ function parseInputs() {
         ? jiraCommentModeRaw
         : "update");
     const jiraFailOnError = core.getInput("jira_fail_on_error") === "true";
+    const transitionTo = core.getInput("transition_to").trim() || undefined;
+    const createIssueOnFailure = core.getInput("create_issue_on_failure") === "true";
+    const issueType = core.getInput("issue_type").trim() || "Bug";
+    const issueProject = core.getInput("issue_project").trim().toUpperCase() || undefined;
+    const githubToken = core.getInput("github_token") || undefined;
+    const allowedHostsRaw = core.getInput("allowed_image_hosts");
+    const allowedImageHosts = allowedHostsRaw
+        ? allowedHostsRaw
+            .split(",")
+            .map((h) => h.trim().toLowerCase())
+            .filter(Boolean)
+        : undefined;
     return {
         projects,
         from,
@@ -30291,6 +30478,12 @@ function parseInputs() {
         postToJira,
         jiraCommentMode,
         jiraFailOnError,
+        transitionTo,
+        createIssueOnFailure,
+        issueType,
+        issueProject,
+        githubToken,
+        allowedImageHosts,
     };
 }
 async function run() {
@@ -30322,47 +30515,83 @@ async function run() {
                 core.info(msg);
             }
         }
-        if (inputs.postToJira && keys.length > 0) {
-            const { context } = github;
-            const isPr = context.eventName === "pull_request" ||
-                context.eventName === "pull_request_target";
-            if (isPr && context.payload.pull_request) {
-                const jiraConfig = {
-                    baseUrl: core.getInput("jira_base_url"),
-                    email: core.getInput("jira_email"),
-                    apiToken: core.getInput("jira_api_token"),
-                };
-                if (!jiraConfig.baseUrl || !jiraConfig.email || !jiraConfig.apiToken) {
-                    const msg = "post_to_jira is enabled but jira_base_url, jira_email, or jira_api_token is missing";
-                    if (inputs.jiraFailOnError) {
-                        core.setFailed(msg);
-                    }
-                    else {
-                        core.warning(msg);
-                    }
+        const needsJira = (inputs.postToJira || !!inputs.transitionTo) && keys.length > 0;
+        if (needsJira) {
+            const jiraConfig = {
+                baseUrl: core.getInput("jira_base_url"),
+                email: core.getInput("jira_email"),
+                apiToken: core.getInput("jira_api_token"),
+            };
+            if (!jiraConfig.baseUrl || !jiraConfig.email || !jiraConfig.apiToken) {
+                const msg = "post_to_jira/transition_to is enabled but jira_base_url, jira_email, or jira_api_token is missing";
+                if (inputs.jiraFailOnError) {
+                    core.setFailed(msg);
                 }
                 else {
-                    const prPayload = context.payload.pull_request;
-                    const pr = {
-                        number: prPayload.number,
-                        title: prPayload.title || "",
-                        body: prPayload.body || "",
-                        url: prPayload.html_url,
-                    };
-                    const prAction = context.payload.action || "opened";
-                    const githubToken = core.getInput("github_token") || undefined;
-                    const allowedHostsRaw = core.getInput("allowed_image_hosts");
-                    const allowedHosts = allowedHostsRaw
-                        ? allowedHostsRaw
-                            .split(",")
-                            .map((h) => h.trim().toLowerCase())
-                            .filter(Boolean)
-                        : undefined;
-                    await (0, jira_1.postToJira)(keys, pr, jiraConfig, inputs.jiraCommentMode, prAction, inputs.jiraFailOnError, githubToken, allowedHosts);
+                    core.warning(msg);
                 }
             }
-            else if (!isPr) {
-                core.info("post_to_jira is enabled but event is not a pull_request — skipping");
+            else {
+                // Posting requires a pull_request event (it needs the PR body/number).
+                if (inputs.postToJira) {
+                    const { context } = github;
+                    const isPr = context.eventName === "pull_request" ||
+                        context.eventName === "pull_request_target";
+                    if (isPr && context.payload.pull_request) {
+                        const prPayload = context.payload.pull_request;
+                        const pr = {
+                            number: prPayload.number,
+                            title: prPayload.title || "",
+                            body: prPayload.body || "",
+                            url: prPayload.html_url,
+                        };
+                        const prAction = context.payload.action || "opened";
+                        await (0, jira_1.postToJira)(keys, pr, jiraConfig, inputs.jiraCommentMode, prAction, inputs.jiraFailOnError, inputs.githubToken, inputs.allowedImageHosts);
+                    }
+                    else if (!isPr) {
+                        core.info("post_to_jira is enabled but event is not a pull_request — skipping");
+                    }
+                }
+                // Transitions only need the issue keys + credentials — event-agnostic.
+                if (inputs.transitionTo) {
+                    await (0, jira_1.transitionIssues)(keys, inputs.transitionTo, jiraConfig, inputs.jiraFailOnError);
+                }
+            }
+        }
+        // Open a Jira ticket when a run has failed. Independent of issue keys —
+        // a failing dependabot PR carries no key, which is exactly the case this
+        // covers. Gated by create_issue_on_failure; the workflow decides when to
+        // run this (a workflow_run on the CI workflow, or an `if: failure()` job).
+        if (inputs.createIssueOnFailure) {
+            const jiraConfig = {
+                baseUrl: core.getInput("jira_base_url"),
+                email: core.getInput("jira_email"),
+                apiToken: core.getInput("jira_api_token"),
+            };
+            const projectKey = inputs.issueProject || inputs.projects[0];
+            if (!jiraConfig.baseUrl || !jiraConfig.email || !jiraConfig.apiToken) {
+                const msg = "create_issue_on_failure is enabled but jira_base_url, jira_email, or jira_api_token is missing";
+                if (inputs.jiraFailOnError)
+                    core.setFailed(msg);
+                else
+                    core.warning(msg);
+            }
+            else if (!projectKey) {
+                const msg = "create_issue_on_failure is enabled but no target project (set issue_project, or projects)";
+                if (inputs.jiraFailOnError)
+                    core.setFailed(msg);
+                else
+                    core.warning(msg);
+            }
+            else {
+                const failureCtx = (0, failure_1.resolveFailureContext)();
+                if (!failureCtx) {
+                    core.info("create_issue_on_failure: no failed run detected for this event — skipping");
+                }
+                else {
+                    const created = await (0, failure_1.createFailureIssue)(failureCtx, jiraConfig, projectKey, inputs.issueType, inputs.jiraFailOnError);
+                    core.setOutput("created_issue", created || "");
+                }
             }
         }
     }
@@ -30419,12 +30648,18 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.extractImageUrls = extractImageUrls;
 exports.replaceImageUrls = replaceImageUrls;
+exports.isPrivateIp = isPrivateIp;
 exports.isSafeUrl = isSafeUrl;
 exports.deduplicateFilenames = deduplicateFilenames;
 exports.downloadImage = downloadImage;
 exports.uploadAttachment = uploadAttachment;
 exports.postToJira = postToJira;
+exports.transitionIssues = transitionIssues;
+exports.createIssue = createIssue;
+exports.searchIssue = searchIssue;
 const core = __importStar(__nccwpck_require__(7484));
+const promises_1 = __nccwpck_require__(1553);
+const node_net_1 = __nccwpck_require__(7030);
 const jira2md_1 = __importDefault(__nccwpck_require__(1851));
 const marked_1 = __nccwpck_require__(9257);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -30452,7 +30687,12 @@ function extractImageUrls(markdown) {
     const tokens = marked_1.marked.lexer(markdown);
     marked_1.marked.walkTokens(tokens, (token) => {
         if (token.type === "image") {
-            results.push({ alt: token.text, url: token.href, raw: token.raw });
+            results.push({
+                alt: token.text,
+                url: token.href,
+                raw: token.raw,
+                title: token.title || undefined,
+            });
         }
     });
     return results;
@@ -30467,11 +30707,14 @@ function replaceImageUrls(markdown, urlToFilename) {
         const img = images[i];
         const filename = urlToFilename.get(img.url);
         if (filename) {
-            const replacement = `![${img.alt}](${filename})`;
+            const titlePart = img.title ? ` "${img.title}"` : "";
+            const replacement = `![${img.alt}](${filename}${titlePart})`;
             const idx = result.lastIndexOf(img.raw);
             if (idx !== -1) {
                 result =
-                    result.slice(0, idx) + replacement + result.slice(idx + img.raw.length);
+                    result.slice(0, idx) +
+                        replacement +
+                        result.slice(idx + img.raw.length);
             }
         }
     }
@@ -30486,7 +30729,27 @@ function isGitHubUrl(url) {
         return false;
     }
 }
-function isSafeUrl(url, allowedHosts) {
+// Strip the IPv4-mapped IPv6 prefix (::ffff:) so embedded IPv4 addresses
+// are matched against the IPv4 private patterns.
+function normalizeIp(ip) {
+    const lower = ip.toLowerCase();
+    if (lower.startsWith("::ffff:")) {
+        const rest = ip.slice(7);
+        if ((0, node_net_1.isIP)(rest) === 4)
+            return rest;
+    }
+    return ip;
+}
+function isPrivateIp(ip) {
+    const normalized = normalizeIp(ip);
+    for (const pattern of PRIVATE_IP_PATTERNS) {
+        if (pattern.test(normalized)) {
+            return true;
+        }
+    }
+    return false;
+}
+async function isSafeUrl(url, allowedHosts) {
     let parsed;
     try {
         parsed = new URL(url);
@@ -30498,15 +30761,36 @@ function isSafeUrl(url, allowedHosts) {
     if (parsed.protocol !== "https:") {
         return false;
     }
-    // If allowlist provided, only those hosts pass
-    if (allowedHosts && allowedHosts.length > 0) {
-        return allowedHosts.includes(parsed.hostname);
-    }
-    // Block private/loopback/link-local IPs
-    for (const pattern of PRIVATE_IP_PATTERNS) {
-        if (pattern.test(parsed.hostname)) {
+    // URL.hostname returns IPv6 wrapped in brackets — strip them
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "");
+    const hasAllowlist = !!(allowedHosts && allowedHosts.length > 0);
+    // If hostname is a literal IP, check it directly — DNS lookup would be a no-op
+    // and the regex patterns must only be applied to actual IPs (not hostnames
+    // that happen to start with digits, like "10.example.com").
+    if ((0, node_net_1.isIP)(hostname)) {
+        if (isPrivateIp(hostname))
             return false;
+        if (hasAllowlist && !allowedHosts.includes(hostname))
+            return false;
+        return true;
+    }
+    // Hostname path: apply allowlist as a *filter*, not a bypass — DNS checks
+    // still run so an allowlisted host that resolves to a private address is rejected.
+    if (hasAllowlist && !allowedHosts.includes(hostname)) {
+        return false;
+    }
+    // Resolve every A/AAAA record and reject if any points to a private range.
+    try {
+        const addresses = await (0, promises_1.lookup)(hostname, { all: true });
+        if (addresses.length === 0)
+            return false;
+        for (const { address } of addresses) {
+            if (isPrivateIp(address))
+                return false;
         }
+    }
+    catch {
+        return false;
     }
     return true;
 }
@@ -30524,33 +30808,40 @@ function filenameFromUrl(url, contentType) {
     return basename;
 }
 function deduplicateFilenames(entries) {
-    // Count occurrences of each filename
-    const counts = new Map();
+    // Pass 1: record every natural filename so suffixed candidates don't steal
+    // a name that another entry still needs.
+    const natural = new Set();
     for (const e of entries) {
-        counts.set(e.filename, (counts.get(e.filename) || 0) + 1);
+        natural.add(e.filename);
     }
-    // For colliding names, append -1, -2, etc.
-    const counters = new Map();
+    // Pass 2: walk entries, assigning the natural name on first occurrence and
+    // a fresh numeric suffix on duplicates — skipping any candidate that's
+    // either already assigned or claimed by a different entry's natural name.
+    const assigned = new Set();
     const result = new Map();
     for (const e of entries) {
-        if ((counts.get(e.filename) || 0) > 1) {
-            const n = (counters.get(e.filename) || 0) + 1;
-            counters.set(e.filename, n);
-            const dotIdx = e.filename.lastIndexOf(".");
-            const dedupedName = dotIdx !== -1
-                ? `${e.filename.slice(0, dotIdx)}-${n}${e.filename.slice(dotIdx)}`
-                : `${e.filename}-${n}`;
-            result.set(e.url, dedupedName);
-        }
-        else {
+        if (!assigned.has(e.filename)) {
+            assigned.add(e.filename);
             result.set(e.url, e.filename);
+            continue;
         }
+        const dotIdx = e.filename.lastIndexOf(".");
+        const stem = dotIdx !== -1 ? e.filename.slice(0, dotIdx) : e.filename;
+        const ext = dotIdx !== -1 ? e.filename.slice(dotIdx) : "";
+        let n = 1;
+        let candidate = `${stem}-${n}${ext}`;
+        while (assigned.has(candidate) || natural.has(candidate)) {
+            n++;
+            candidate = `${stem}-${n}${ext}`;
+        }
+        assigned.add(candidate);
+        result.set(e.url, candidate);
     }
     return result;
 }
 async function downloadImage(url, githubToken, allowedHosts) {
     try {
-        if (!isSafeUrl(url, allowedHosts)) {
+        if (!(await isSafeUrl(url, allowedHosts))) {
             core.warning(`Blocked image download from unsafe URL: ${url}`);
             return null;
         }
@@ -30558,13 +30849,21 @@ async function downloadImage(url, githubToken, allowedHosts) {
         if (githubToken && isGitHubUrl(url)) {
             headers["Authorization"] = `token ${githubToken}`;
         }
-        const response = await fetch(url, { headers });
+        // redirect: "manual" prevents fetch from auto-following redirects to a
+        // private address that wouldn't pass isSafeUrl.
+        const response = await fetch(url, { headers, redirect: "manual" });
+        // Manual redirect handling returns the 3xx response itself. Reject it —
+        // the redirect target would need its own SSRF validation.
+        if (response.status >= 300 && response.status < 400) {
+            core.warning(`Blocked redirect from ${url} to ${response.headers.get("location") || "(unknown)"}`);
+            return null;
+        }
         if (!response.ok) {
             core.warning(`Failed to download image ${url}: ${response.status}`);
             return null;
         }
         const rawContentType = response.headers.get("content-type") || "application/octet-stream";
-        const contentType = stripContentType(rawContentType);
+        const contentType = stripContentType(rawContentType).toLowerCase();
         // Validate content type is an image
         if (!contentType.startsWith("image/")) {
             core.warning(`Rejected non-image content-type "${contentType}" from ${url}`);
@@ -30759,6 +31058,100 @@ async function postToJira(keys, pr, config, mode, prAction, failOnError, githubT
             core.warning(msg);
         }
     }
+}
+async function transitionIssues(keys, targetStatus, config, failOnError) {
+    config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") };
+    const wanted = targetStatus.toLowerCase();
+    for (const key of keys) {
+        try {
+            const url = `${config.baseUrl}/rest/api/2/issue/${encodeURIComponent(key)}/transitions`;
+            const listRes = await fetch(url, {
+                headers: {
+                    Authorization: authHeader(config),
+                    Accept: "application/json",
+                },
+            });
+            if (!listRes.ok) {
+                throw new Error(`Failed to fetch transitions for ${key}: ${listRes.status} ${listRes.statusText}`);
+            }
+            const { transitions } = (await listRes.json());
+            const match = transitions.find((t) => t.name.toLowerCase() === wanted);
+            if (!match) {
+                const available = transitions.map((t) => t.name).join(", ") || "none";
+                core.warning(`No "${targetStatus}" transition available for ${key} (available: ${available})`);
+                continue;
+            }
+            const postRes = await fetch(url, {
+                method: "POST",
+                headers: {
+                    Authorization: authHeader(config),
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                },
+                body: JSON.stringify({ transition: { id: match.id } }),
+            });
+            if (!postRes.ok) {
+                throw new Error(`Failed to transition ${key} to ${targetStatus}: ${postRes.status} ${postRes.statusText}`);
+            }
+            core.info(`Transitioned ${key} → ${targetStatus}`);
+        }
+        catch (error) {
+            const msg = `Failed to transition ${key}: ${error instanceof Error ? error.message : String(error)}`;
+            if (failOnError) {
+                throw new Error(msg);
+            }
+            core.warning(msg);
+        }
+    }
+}
+async function createIssue(config, opts) {
+    config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") };
+    const url = `${config.baseUrl}/rest/api/2/issue`;
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            Authorization: authHeader(config),
+            "Content-Type": "application/json",
+            Accept: "application/json",
+        },
+        body: JSON.stringify({
+            fields: {
+                project: { key: opts.projectKey },
+                issuetype: { name: opts.issueType },
+                summary: opts.summary,
+                description: opts.description,
+                ...(opts.labels && opts.labels.length > 0
+                    ? { labels: opts.labels }
+                    : {}),
+            },
+        }),
+    });
+    if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`Failed to create issue in ${opts.projectKey}: ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`);
+    }
+    const data = (await res.json());
+    return data.key;
+}
+// Uses the enhanced JQL search endpoint (the legacy /rest/api/2/search is being
+// sunset by Atlassian). Returns the first matching issue key, or null.
+async function searchIssue(config, jql) {
+    config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") };
+    const url = `${config.baseUrl}/rest/api/3/search/jql`;
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            Authorization: authHeader(config),
+            "Content-Type": "application/json",
+            Accept: "application/json",
+        },
+        body: JSON.stringify({ jql, maxResults: 1, fields: ["key"] }),
+    });
+    if (!res.ok) {
+        throw new Error(`Failed to search issues: ${res.status} ${res.statusText}`);
+    }
+    const data = (await res.json());
+    return data.issues?.[0]?.key ?? null;
 }
 
 
@@ -30998,11 +31391,27 @@ module.exports = require("node:crypto");
 
 /***/ }),
 
+/***/ 1553:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:dns/promises");
+
+/***/ }),
+
 /***/ 8474:
 /***/ ((module) => {
 
 "use strict";
 module.exports = require("node:events");
+
+/***/ }),
+
+/***/ 7030:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:net");
 
 /***/ }),
 

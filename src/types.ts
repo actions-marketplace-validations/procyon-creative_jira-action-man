@@ -11,6 +11,25 @@ export interface ActionInputs {
   postToJira: boolean;
   jiraCommentMode: JiraCommentMode;
   jiraFailOnError: boolean;
+  transitionTo?: string;
+  createIssueOnFailure: boolean;
+  issueType: string;
+  issueProject?: string;
+  githubToken?: string;
+  allowedImageHosts?: string[];
+}
+
+export interface FailureContext {
+  /** Human label for the failing thing, e.g. "PR #6" or "branch main". */
+  title: string;
+  /** owner/repo */
+  repo?: string;
+  prNumber?: number;
+  branch?: string;
+  /** PR html_url, when a PR is associated. */
+  url?: string;
+  /** URL of the failed workflow run, when available. */
+  runUrl?: string;
 }
 
 export interface JiraConfig {

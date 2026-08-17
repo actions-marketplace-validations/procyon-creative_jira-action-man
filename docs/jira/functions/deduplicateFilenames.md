@@ -8,7 +8,7 @@
 
 > **deduplicateFilenames**(`entries`): `Map`\<`string`, `string`\>
 
-Defined in: [jira.ts:124](https://github.com/procyon-creative/jira-action-man/blob/ec8e53e5639ff626b77256a9793c0a5912c45a97/src/jira.ts#L124)
+Defined in: [jira.ts:177](https://github.com/procyon-creative/jira-action-man/blob/37df913da3194bdeead9a41e8c8da2c30899b860/src/jira.ts#L177)
 
 ## Parameters
 
